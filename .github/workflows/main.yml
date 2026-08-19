@@ -1,0 +1,171 @@
+name: Build mobile apps (APK + IPA)
+
+# Run manually from the Actions tab, or automatically on every push to main.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  # ────────────────────────────────────────────────────────────────
+  # ANDROID — produces a working .apk with ZERO extra setup.
+  # A debug APK is always built. If you add the ANDROID_KEYSTORE_BASE64
+  # secret (and friends, see MOBILE_BUILD.md) it also builds a signed
+  # release APK.
+  # ────────────────────────────────────────────────────────────────
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Prepare web assets (public/player.html -> www/index.html)
+        run: npm run prepare:www
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Add Android platform
+        run: npx cap add android
+
+      - name: Sync Capacitor
+        run: npx cap sync android
+
+      - name: Decode release keystore (only if configured)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Build signed release APK
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        working-directory: android
+        env:
+          KS_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PW: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=release.keystore \
+            -Pandroid.injected.signing.store.password="$KS_PW" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PW"
+
+      - name: Upload APK(s)
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          if-no-files-found: warn
+          path: |
+            android/app/build/outputs/apk/debug/*.apk
+            android/app/build/outputs/apk/release/*.apk
+
+  # ────────────────────────────────────────────────────────────────
+  # iOS — Apple requires every app to be code-signed before it can run
+  # on a real iPhone, even for personal side-loading. That signing
+  # identity has to come from YOUR Apple ID / Apple Developer account —
+  # no CI script can generate it for you. See MOBILE_BUILD.md.
+  #
+  # Without the IOS_* secrets below, this job still runs and produces
+  # an UNSIGNED .xcarchive so you can confirm the build succeeds, but
+  # it will NOT install on a real device.
+  # ────────────────────────────────────────────────────────────────
+  ios:
+    name: Build iOS IPA
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Prepare web assets (public/player.html -> www/index.html)
+        run: npm run prepare:www
+
+      - name: Add iOS platform
+        run: npx cap add ios
+
+      - name: Sync Capacitor
+        run: npx cap sync ios
+
+      - name: Install signing certificate & provisioning profile
+        if: ${{ secrets.IOS_CERTIFICATE_BASE64 != '' && secrets.IOS_PROVISION_PROFILE_BASE64 != '' }}
+        env:
+          IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+          IOS_PROVISION_PROFILE_BASE64: ${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERT_PATH="$RUNNER_TEMP/certificate.p12"
+          PROFILE_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+
+          echo -n "$IOS_CERTIFICATE_BASE64" | base64 --decode -o "$CERT_PATH"
+          echo -n "$IOS_PROVISION_PROFILE_BASE64" | base64 --decode -o "$PROFILE_PATH"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$IOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
+
+      - name: Archive & export signed IPA
+        if: ${{ secrets.IOS_CERTIFICATE_BASE64 != '' && secrets.IOS_PROVISION_PROFILE_BASE64 != '' }}
+        working-directory: ios/App
+        run: |
+          xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" -allowProvisioningUpdates archive
+
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key>
+            <string>ad-hoc</string>
+            <key>compileBitcode</key>
+            <false/>
+          </dict>
+          </plist>
+          PLIST
+
+          xcodebuild -exportArchive -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/build"
+
+      - name: Build unsigned archive (no signing secrets configured)
+        if: ${{ secrets.IOS_CERTIFICATE_BASE64 == '' || secrets.IOS_PROVISION_PROFILE_BASE64 == '' }}
+        working-directory: ios/App
+        run: |
+          echo "::warning::No Apple signing secrets found (IOS_CERTIFICATE_BASE64 / IOS_PROVISION_PROFILE_BASE64)."
+          echo "::warning::Building an UNSIGNED archive only - see MOBILE_BUILD.md to get a real, installable .ipa."
+          xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" archive
+
+      - name: Upload IPA (or unsigned archive)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/build/*.ipa
+            ${{ runner.temp }}/App.xcarchive
