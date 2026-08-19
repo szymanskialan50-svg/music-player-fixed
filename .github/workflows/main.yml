@@ -40,8 +40,21 @@ jobs:
       - name: Sync Capacitor
         run: npx cap sync android
 
-      - name: Decode release keystore (only if configured)
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+      # NOTE: the `secrets` context can't be used directly inside an `if:`
+      # condition (GitHub Actions restriction) — it can only appear inside
+      # `run:`/`env:`. So we check it in a `run:` step and expose the result
+      # as a step output, then branch on THAT output in later `if:` checks.
+      - name: Check Android signing secrets
+        id: android_secrets
+        run: |
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Decode release keystore
+        if: steps.android_secrets.outputs.configured == 'true'
         run: echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore
 
       - name: Build debug APK
@@ -49,7 +62,7 @@ jobs:
         run: ./gradlew assembleDebug
 
       - name: Build signed release APK
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        if: steps.android_secrets.outputs.configured == 'true'
         working-directory: android
         env:
           KS_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
@@ -103,8 +116,19 @@ jobs:
       - name: Sync Capacitor
         run: npx cap sync ios
 
+      # Same reasoning as the Android job: `secrets` isn't allowed directly
+      # inside `if:`, so resolve it to a step output first.
+      - name: Check iOS signing secrets
+        id: ios_secrets
+        run: |
+          if [ -n "${{ secrets.IOS_CERTIFICATE_BASE64 }}" ] && [ -n "${{ secrets.IOS_PROVISION_PROFILE_BASE64 }}" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install signing certificate & provisioning profile
-        if: ${{ secrets.IOS_CERTIFICATE_BASE64 != '' && secrets.IOS_PROVISION_PROFILE_BASE64 != '' }}
+        if: steps.ios_secrets.outputs.configured == 'true'
         env:
           IOS_CERTIFICATE_BASE64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
           IOS_CERTIFICATE_PASSWORD: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
@@ -128,7 +152,7 @@ jobs:
           cp "$PROFILE_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
 
       - name: Archive & export signed IPA
-        if: ${{ secrets.IOS_CERTIFICATE_BASE64 != '' && secrets.IOS_PROVISION_PROFILE_BASE64 != '' }}
+        if: steps.ios_secrets.outputs.configured == 'true'
         working-directory: ios/App
         run: |
           xcodebuild -workspace App.xcworkspace -scheme App -configuration Release \
@@ -152,7 +176,7 @@ jobs:
             -exportPath "$RUNNER_TEMP/build"
 
       - name: Build unsigned archive (no signing secrets configured)
-        if: ${{ secrets.IOS_CERTIFICATE_BASE64 == '' || secrets.IOS_PROVISION_PROFILE_BASE64 == '' }}
+        if: steps.ios_secrets.outputs.configured == 'false'
         working-directory: ios/App
         run: |
           echo "::warning::No Apple signing secrets found (IOS_CERTIFICATE_BASE64 / IOS_PROVISION_PROFILE_BASE64)."
